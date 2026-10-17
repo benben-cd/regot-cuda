@@ -9,6 +9,12 @@ namespace py = pybind11;
 #if defined(TORCH_BUILD)
 
 #include <torch/extension.h>
+#include "backward_context.h"
+
+py::dict torch_solve_backward_native(
+    torch::Tensor T, torch::Tensor rhs, SPLRBackwardContext& context,
+    const std::string& mode, double tol, int max_iter
+);
 
 py::dict torch_sinkhorn_bcd(
     torch::Tensor M, torch::Tensor a, torch::Tensor b,
@@ -21,6 +27,15 @@ py::dict torch_sinkhorn_splr(
     double reg, double tol, int max_iter, int verbose,
     const py::kwargs& kwargs
 );
+
+py::dict torch_sinkhorn_splr_save_ctx(
+    torch::Tensor M, torch::Tensor a, torch::Tensor b,
+    double reg, double tol, int max_iter, int verbose,
+    const py::kwargs& kwargs
+);
+
+// Register the SPLRBackwardContext class (defined in solvers_torch.cpp)
+void register_backward_context(py::module_& m);
 
 #else
 
@@ -88,6 +103,23 @@ PYBIND11_MODULE(MODULE_NAME, m)
         py::arg("M"), py::arg("a"), py::arg("b"), py::arg("reg"),
         py::arg("tol") = 1e-6, py::arg("max_iter") = 1000, py::arg("verbose") = 0,
         "Sinkhorn SPLR algorithm (CUDA implementation with PyTorch interface)");
+
+    // Backward context class and the backward-capable solver
+    register_backward_context(m_torch);
+
+    // Keep the native PCG boundary private to Python backward orchestration.
+    m_torch.def("_solve_backward_native", &torch_solve_backward_native,
+        py::arg("T"), py::arg("rhs"), py::arg("context"),
+        py::arg("mode") = "diag", py::arg("tol") = 1e-6,
+        py::arg("max_iter") = 2000,
+        "Internal native reduced-Q PCG solver");
+
+    // Export forward results together with the retained backward context.
+    m_torch.def("sinkhorn_splr_save_ctx", &torch_sinkhorn_splr_save_ctx,
+        py::arg("M"), py::arg("a"), py::arg("b"), py::arg("reg"),
+        py::arg("tol") = 1e-6, py::arg("max_iter") = 1000, py::arg("verbose") = 0,
+        "Sinkhorn SPLR algorithm with backward context export "
+        "(CUDA implementation with PyTorch interface)");
 
 #else
 

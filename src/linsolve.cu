@@ -1,5 +1,8 @@
 #include "linsolve.h"
 
+#include <cstdio>
+#include <cstdlib>
+
 // CUDA error checking macro
 #define CUDA_CHECK(call) \
     do { \
@@ -21,7 +24,6 @@
     } while (0)
 
 
-
 SparseCholeskySolver::SparseCholeskySolver()
 {
     // Handle initialization
@@ -31,7 +33,10 @@ SparseCholeskySolver::SparseCholeskySolver()
     CUDSS_CHECK(cudssConfigCreate(&m_config));
     // Use CUDSS_ALG_DEFAULT
     cudssAlgType_t reorder_alg = CUDSS_ALG_DEFAULT;
-    CUDSS_CHECK(cudssConfigSet(m_config, CUDSS_CONFIG_REORDERING_ALG, (void*)&reorder_alg, sizeof(cudssAlgType_t)));
+    CUDSS_CHECK(cudssConfigSet(
+        m_config, CUDSS_CONFIG_REORDERING_ALG,
+        (void*)&reorder_alg, sizeof(cudssAlgType_t)
+    ));
 
     // Data object creation
     CUDSS_CHECK(cudssDataCreate(m_handle, &m_data));
@@ -41,16 +46,114 @@ SparseCholeskySolver::SparseCholeskySolver()
     CUDSS_CHECK(cudssSetStream(m_handle, m_stream));
 }
 
+// Destroy all owned handles. Every call is guarded against nullptr so that
+// a partially-initialized or moved-from solver is safe to destroy.
+//
+// Do not use CUDA_CHECK/CUDSS_CHECK here: destructors may run during CUDA
+// context teardown, at which point CUDA/cuDSS calls may legitimately fail.
+void SparseCholeskySolver::release()
+{
+    // Factorization and solve may be asynchronous. Make sure cuDSS has
+    // stopped operating on the user buffers before any owner frees them.
+    if (m_stream != nullptr)
+    {
+        cudaStreamSynchronize(m_stream);
+    }
+
+    // Matrix objects are lightweight wrappers around user buffers. Destroy
+    // the wrappers before destroying the solver data and handle.
+    if (m_A != nullptr)
+    {
+        cudssMatrixDestroy(m_A);
+        m_A = nullptr;
+    }
+    if (m_x != nullptr)
+    {
+        cudssMatrixDestroy(m_x);
+        m_x = nullptr;
+    }
+    if (m_b != nullptr)
+    {
+        cudssMatrixDestroy(m_b);
+        m_b = nullptr;
+    }
+
+    if (m_data != nullptr && m_handle != nullptr)
+    {
+        cudssDataDestroy(m_handle, m_data);
+        m_data = nullptr;
+    }
+    if (m_config != nullptr)
+    {
+        cudssConfigDestroy(m_config);
+        m_config = nullptr;
+    }
+    if (m_handle != nullptr)
+    {
+        cudssDestroy(m_handle);
+        m_handle = nullptr;
+    }
+
+    if (m_stream != nullptr)
+    {
+        cudaStreamDestroy(m_stream);
+        m_stream = nullptr;
+    }
+}
+
 SparseCholeskySolver::~SparseCholeskySolver()
 {
-    // Cleanup
-    CUDA_CHECK(cudaStreamDestroy(m_stream));
-    CUDSS_CHECK(cudssMatrixDestroy(m_A));
-    CUDSS_CHECK(cudssMatrixDestroy(m_x));
-    CUDSS_CHECK(cudssMatrixDestroy(m_b));
-    CUDSS_CHECK(cudssDataDestroy(m_handle, m_data));
-    CUDSS_CHECK(cudssConfigDestroy(m_config));
-    CUDSS_CHECK(cudssDestroy(m_handle));
+    release();
+}
+
+SparseCholeskySolver::SparseCholeskySolver(SparseCholeskySolver&& other) noexcept
+{
+    // Steal all handles from the source object
+    m_stream = other.m_stream;
+    m_handle = other.m_handle;
+    m_config = other.m_config;
+    m_data   = other.m_data;
+    m_A      = other.m_A;
+    m_b      = other.m_b;
+    m_x      = other.m_x;
+
+    // Leave the source empty
+    other.m_stream = nullptr;
+    other.m_handle = nullptr;
+    other.m_config = nullptr;
+    other.m_data   = nullptr;
+    other.m_A      = nullptr;
+    other.m_b      = nullptr;
+    other.m_x      = nullptr;
+}
+
+SparseCholeskySolver& SparseCholeskySolver::operator=(SparseCholeskySolver&& other) noexcept
+{
+    if (this != &other)
+    {
+        // Release the resources currently held. This also synchronizes the
+        // current stream before destroying cuDSS objects.
+        release();
+
+        // Steal all handles from the source object
+        m_stream = other.m_stream;
+        m_handle = other.m_handle;
+        m_config = other.m_config;
+        m_data   = other.m_data;
+        m_A      = other.m_A;
+        m_b      = other.m_b;
+        m_x      = other.m_x;
+
+        // Leave the source empty
+        other.m_stream = nullptr;
+        other.m_handle = nullptr;
+        other.m_config = nullptr;
+        other.m_data   = nullptr;
+        other.m_A      = nullptr;
+        other.m_b      = nullptr;
+        other.m_x      = nullptr;
+    }
+    return *this;
 }
 
 void SparseCholeskySolver::set_A(
@@ -58,6 +161,13 @@ void SparseCholeskySolver::set_A(
     int n, size_t nnz
 )
 {
+    // Replace semantics: each create must be paired with a destroy.
+    if (m_A != nullptr)
+    {
+        CUDSS_CHECK(cudssMatrixDestroy(m_A));
+        m_A = nullptr;
+    }
+
     // CUDSS_MTYPE_SPD for Cholesky decomposition
     CUDSS_CHECK(cudssMatrixCreateCsr(
         &m_A, n, n, nnz,
@@ -69,6 +179,13 @@ void SparseCholeskySolver::set_A(
 
 void SparseCholeskySolver::set_b(double* d_rhs, int n, int nrhs)
 {
+    // Replace semantics: each create must be paired with a destroy.
+    if (m_b != nullptr)
+    {
+        CUDSS_CHECK(cudssMatrixDestroy(m_b));
+        m_b = nullptr;
+    }
+
     CUDSS_CHECK(cudssMatrixCreateDn(
         &m_b, n, nrhs, n,
         d_rhs,
@@ -78,6 +195,13 @@ void SparseCholeskySolver::set_b(double* d_rhs, int n, int nrhs)
 
 void SparseCholeskySolver::set_x(double* d_sol, int n, int nrhs)
 {
+    // Replace semantics: each create must be paired with a destroy.
+    if (m_x != nullptr)
+    {
+        CUDSS_CHECK(cudssMatrixDestroy(m_x));
+        m_x = nullptr;
+    }
+
     CUDSS_CHECK(cudssMatrixCreateDn(
         &m_x, n, nrhs, n,
         d_sol,
@@ -161,6 +285,9 @@ void sparse_cholesky_solve(
     solver.factorize();
     // Step 3: Solve
     solver.solve();
+
+    // The solver destructor synchronizes its stream before returning from
+    // this scope, so d_x is ready for subsequent copies.
 }
 
 // Host function, mainly to test sparse Cholesky solver
@@ -195,7 +322,7 @@ void sparse_cholesky_solve_host(
 
     // Copy results back to host
     CUDA_CHECK(cudaMemcpy(x, d_x, n * sizeof(double), cudaMemcpyDeviceToHost));
-    
+
     // Free device memory
     CUDA_CHECK(cudaFree(d_values));
     CUDA_CHECK(cudaFree(d_rhs));

@@ -2,6 +2,8 @@
 #include <cmath>
 #include <thread>
 #include <atomic>
+#include <utility>
+#include <memory>
 
 // CUDA headers
 #include <cuda_runtime.h>
@@ -17,6 +19,9 @@
 
 // Linear solver
 #include "linsolve.h"
+
+// Backward-propagation context
+#include "backward_context.h"
 
 // CUDA error checking macro
 #define CUDA_CHECK(call) \
@@ -167,7 +172,7 @@ private:
     int*          d_iwork;
     double*       h_pinned;
     // Sparse Cholesky solver
-    SparseCholeskySolver m_linsolver;
+    std::unique_ptr<SparseCholeskySolver> m_linsolver;
 
 public:
     // Constructor
@@ -177,7 +182,8 @@ public:
         bool input_on_device = false
     ):
         m_n(n), m_m(m), m_Me(n * m), m_Te(n * (m - 1)), m_Hsize(n + m - 1), m_Kmax(Kmax), m_reg(reg),
-        d_M_storage(nullptr), m_sinkhorn_stop_flag(true)
+        d_M_storage(nullptr), m_sinkhorn_stop_flag(true),
+        m_linsolver(std::make_unique<SparseCholeskySolver>())
     {
         nvtx3::scoped_range r{"SPLRSolver"};
 
@@ -260,37 +266,37 @@ public:
     {
         nvtx3::scoped_range r{"~SPLRSolver"};
 
-        // Free device memory
-        if (d_M_storage != nullptr)
-        {
-            CUDA_CHECK(cudaFree(d_M_storage));
-        }
-        CUDA_CHECK(cudaFree(d_ab));
-        CUDA_CHECK(cudaFree(d_logab));
-        CUDA_CHECK(cudaFree(d_gamma));
-        CUDA_CHECK(cudaFree(d_gamma_prev));
-        CUDA_CHECK(cudaFree(d_gamma_bcd));
-        CUDA_CHECK(cudaFree(d_grad_bcd));
-        CUDA_CHECK(cudaFree(d_grad_prev));
-        CUDA_CHECK(cudaFree(d_linsolve_rhs));
-        CUDA_CHECK(cudaFree(d_linsolve_sol));
-        // CUDA_CHECK(cudaFree(d_grad));
-        // CUDA_CHECK(cudaFree(d_direc));
-        // CUDA_CHECK(cudaFree(d_y));
-        // CUDA_CHECK(cudaFree(d_invA_y));
-        CUDA_CHECK(cudaFree(d_s));
-        CUDA_CHECK(cudaFree(d_Hvalues));
-        CUDA_CHECK(cudaFree(d_Hflatind));
-        CUDA_CHECK(cudaFree(d_Hcolind));
-        CUDA_CHECK(cudaFree(d_Hrowptr));
-        CUDA_CHECK(cudaFree(d_work));
-        CUDA_CHECK(cudaFree(d_iwork));
+        // Destroy cuDSS objects before freeing the CUDA buffers they reference.
+        // In the future transfer path this pointer may already be null.
+        m_linsolver.reset();
+
+        // Free device memory. Null guards keep the moved-from state safe after
+        // backward-state ownership has been transferred to a context.
+        if (d_M_storage != nullptr) CUDA_CHECK(cudaFree(d_M_storage));
+        if (d_ab != nullptr) CUDA_CHECK(cudaFree(d_ab));
+        if (d_logab != nullptr) CUDA_CHECK(cudaFree(d_logab));
+        if (d_gamma != nullptr) CUDA_CHECK(cudaFree(d_gamma));
+        if (d_gamma_prev != nullptr) CUDA_CHECK(cudaFree(d_gamma_prev));
+        if (d_gamma_bcd != nullptr) CUDA_CHECK(cudaFree(d_gamma_bcd));
+        if (d_grad_bcd != nullptr) CUDA_CHECK(cudaFree(d_grad_bcd));
+        if (d_grad_prev != nullptr) CUDA_CHECK(cudaFree(d_grad_prev));
+        if (d_linsolve_rhs != nullptr) CUDA_CHECK(cudaFree(d_linsolve_rhs));
+        if (d_linsolve_sol != nullptr) CUDA_CHECK(cudaFree(d_linsolve_sol));
+        // d_grad, d_direc, d_y and d_invA_y are aliases into the two blocks
+        // above and must not be freed separately.
+        if (d_s != nullptr) CUDA_CHECK(cudaFree(d_s));
+        if (d_Hvalues != nullptr) CUDA_CHECK(cudaFree(d_Hvalues));
+        if (d_Hflatind != nullptr) CUDA_CHECK(cudaFree(d_Hflatind));
+        if (d_Hcolind != nullptr) CUDA_CHECK(cudaFree(d_Hcolind));
+        if (d_Hrowptr != nullptr) CUDA_CHECK(cudaFree(d_Hrowptr));
+        if (d_work != nullptr) CUDA_CHECK(cudaFree(d_work));
+        if (d_iwork != nullptr) CUDA_CHECK(cudaFree(d_iwork));
 
         // Free pinned memory
-        CUDA_CHECK(cudaFreeHost(h_pinned));
+        if (h_pinned != nullptr) CUDA_CHECK(cudaFreeHost(h_pinned));
 
         // Destroy CUDA stream for Sinkhorn iterations
-        CUDA_CHECK(cudaStreamDestroy(m_sinkhorn_stream));
+        if (m_sinkhorn_stream != nullptr) CUDA_CHECK(cudaStreamDestroy(m_sinkhorn_stream));
     }
 
     // Sinkhorn iteration to update alpha
@@ -560,16 +566,16 @@ public:
         // direc = invA_g = inv(A) * g;
         Timer timer(verbose >= 3);
         timer.tic();
-        cudaStream_t stream = m_linsolver.get_cuda_stream();
+        cudaStream_t stream = m_linsolver->get_cuda_stream();
         // If low_rank = true, then we need to solve two vectors,
         //     A * [direc, invA_y] = [grad, y]
         // Otherwise we only solve A * direc = grad
         // Since the memory layout is d_linsolve_rhs = [d_grad, d_y] and
         // d_linsolve_sol = [d_direc, d_invA_y], we just need to specify
         // how many rhs to solve
-        m_linsolver.set_A(d_Hvalues, d_Hcolind, d_Hrowptr, m_Hsize, nnz);
-        m_linsolver.set_b(d_linsolve_rhs, m_Hsize, low_rank ? 2 : 1);
-        m_linsolver.set_x(d_linsolve_sol, m_Hsize, low_rank ? 2 : 1);
+        m_linsolver->set_A(d_Hvalues, d_Hcolind, d_Hrowptr, m_Hsize, nnz);
+        m_linsolver->set_b(d_linsolve_rhs, m_Hsize, low_rank ? 2 : 1);
+        m_linsolver->set_x(d_linsolve_sol, m_Hsize, low_rank ? 2 : 1);
 
         if (analyze_pattern)
         {
@@ -578,7 +584,7 @@ public:
                 nvtx3::scoped_range reorder{"reorder"};
 
                 // Reordering stage mainly runs on CPU
-                m_linsolver.reorder();
+                m_linsolver->reorder();
                 timer.toc("reorder");
             }
 
@@ -600,13 +606,13 @@ public:
             // Scope for NVTX3 annotation
             {
                 nvtx3::scoped_range sym_fac{"sym_fac"};
-                m_linsolver.symfac();
+                m_linsolver->symfac();
                 timer.toc("symfac");
             }
         }
-        m_linsolver.factorize();
+        m_linsolver->factorize();
         timer.toc("factorize");
-        m_linsolver.solve();
+        m_linsolver->solve();
         timer.toc("solve");
 
         // After calling solve(), d_direc will contain the desired value
@@ -926,6 +932,71 @@ public:
         CUDA_CHECK(cudaMemcpy(d_gamma, d_gamma_bcd, m_Hsize * sizeof(double), cudaMemcpyDeviceToDevice));
     }
 
+    // --- Backward-context export (used by cuda_sinkhorn_splr_save_ctx) ---
+
+    // Snapshot the current sparsified Hessian CSR triple into the backward
+    // context for immediate-convergence fallback; the normal path uses
+    // transfer_backward_state_to().
+    void snapshot_sphess(SPLRBackwardContext& ctx, size_t nnz) const
+    {
+        ctx.snapshot_sphess(d_Hvalues, d_Hcolind, d_Hrowptr, nnz);
+    }
+
+    // Transfer the forward-owned cuDSS state and all backing buffers needed
+    // by the backward preconditioner to the context. This is the normal path: reuse the existing forward factorization with zero extra
+    // backward factorization.
+    //
+    // The transferred cuDSS wrappers depend on the following base allocations:
+    //   d_Hvalues / d_Hcolind / d_Hrowptr
+    //   d_linsolve_rhs / d_linsolve_sol
+    // The low-rank apply path additionally needs d_s. d_y and d_invA_y are
+    // aliases into the second columns of rhs/sol and are reconstructed by the
+    // context after adoption.
+    void transfer_backward_state_to(
+        SPLRBackwardContext& ctx,
+        size_t nnz,
+        double ys,
+        bool low_rank
+    )
+    {
+        if (!m_linsolver)
+        {
+            fprintf(stderr, "SPLRSolver: no linear solver state to transfer\n");
+            exit(EXIT_FAILURE);
+        }
+
+        // Ensure that no cuDSS operation or forward CUDA kernel is still using
+        // the backing buffers before ownership changes hands.
+        CUDA_CHECK(cudaStreamSynchronize(m_linsolver->get_cuda_stream()));
+        CUDA_CHECK(cudaDeviceSynchronize());
+
+        ctx.adopt_forward_state(
+            std::move(m_linsolver),
+            d_Hvalues, d_Hcolind, d_Hrowptr,
+            (int)m_Hsize, nnz,
+            d_linsolve_rhs, d_linsolve_sol,
+            d_s,
+            ys, low_rank, m_reg, false
+        );
+
+        // Leave the source in a valid moved-from state. The context is now the
+        // sole owner of these base allocations.
+        m_linsolver = nullptr;
+        d_Hvalues = nullptr;
+        d_Hcolind = nullptr;
+        d_Hrowptr = nullptr;
+        d_linsolve_rhs = nullptr;
+        d_linsolve_sol = nullptr;
+        d_s = nullptr;
+
+        // These are aliases into rhs/sol and must not survive as dangling
+        // pointers in the source object.
+        d_grad = nullptr;
+        d_y = nullptr;
+        d_direc = nullptr;
+        d_invA_y = nullptr;
+    }
+
     // Output results to host -- transport plan and dual variables
     void output_result(double* P, double* dual, bool output_on_device = false)
     {
@@ -1177,6 +1248,310 @@ void cuda_sinkhorn_splr(
     // Final Sinkhorn iteration
     // solver.update_beta();
     // solver.update_alpha();
+
+    // Compute final transport plan and output results to host
+    solver.output_result(P, dual, output_on_device);
+    CUDA_CHECK(cudaDeviceSynchronize());
+}
+
+
+// Backward-capable variant of cuda_sinkhorn_splr.
+//
+// The forward iteration is identical to cuda_sinkhorn_splr(), except that
+// 1. a normal path with at least one completed iteration transfers the last
+//    forward cuDSS factorization and its exact backing buffers into the
+//    backward context;
+// 2. if the loop is never entered (immediate convergence), the sparsified
+//    Hessian at the final point is factorized inside the context as a
+//    fallback, without the low-rank correction.
+//
+// note: normal paths that completed at least one forward
+// factorization transfer the existing SparseCholeskySolver and its exact
+// backing buffers into the backward context. This reuses the forward cuDSS
+// factorization directly, so the normal path performs zero extra backward
+// factorization. Immediate-convergence fallback still uses snapshot +
+// context-refactorization because no forward factorization exists.
+//
+void cuda_sinkhorn_splr_save_ctx(
+    const double* M, const double* a, const double* b, double* P,
+    double reg, int max_iter, double tol, int n, int m, int* niter,
+    double density_max, double shift_max,
+    int sparsity_pattern_cycle, int candidate_sinkhorn_iter, int verbose,
+    const double* x0, double* dual,
+    bool input_on_device, bool output_on_device,
+    SPLRBackwardContext* ctx, bool* converged
+)
+{
+    // Algorithmic parameters
+    // density
+    density_max = std::min(density_max, 1.0);
+    density_max = std::max(density_max, 0.0);
+    const double density_min = 0.01 * density_max;
+    double density = 0.1 * density_max;
+    // shift
+    double shift = shift_max;
+    // Kmax -- maximum number of nonzero elements in sparsified T_t
+    size_t Kmax = static_cast<size_t>(density_max * n * (m - 1));
+    Kmax = std::max(Kmax, size_t(1));
+
+    // Create solver object
+    SPLRSolver solver(M, a, b, reg, n, m, Kmax, input_on_device);
+
+    // Initialize dual variables
+    solver.init_dual(x0, input_on_device);
+
+    // Initial objective function value (f), gradient (g),
+    // and sparsified Hessian (sphess)
+    double objfn, gnorm;
+    // Only compute f and g
+    constexpr bool compute_gnorm = true;
+    solver.dual_T_objfn_grad(objfn, gnorm, compute_gnorm, false);
+    // ||grad|| will be used for updating shift
+    double gnorm_init = gnorm;
+    shift = std::min(gnorm, shift_max);
+    // Then continue computing sphess by
+    // Note: shift should be applied to Hessian, but what we compute is Hsl = H * reg
+    // Therefore, here we multiply shift by reg before adding to Hsl
+    size_t nnz = solver.dual_sphess(density, shift * reg, false);
+
+    // Main iteration
+    // Initial step size
+    double alpha = 1.0;
+    // Low-rank materials of the last completed iteration, hoisted out of
+    // the loop so that they can be exported to the backward context
+    double ys = 0.0, yy = 0.0;
+    bool low_rank = false;
+    // Convergence flag
+    bool converged_flag = false;
+    // Set when a completed update produces a non-finite objective or gradient.
+    // This keeps the delayed-Hessian stop condition and context export check
+    // consistent without changing the normal numerical path.
+    bool invalid_state = false;
+    // Timer
+    Timer timer_inner(verbose >= 2);
+    for (int iter = 0; iter < max_iter; iter++)
+    {
+        if (verbose >= 1)
+        {
+            std::cout << "iter = " << iter << ", objval = " << objfn <<
+                ", ||grad|| = " << gnorm << std::endl;
+        }
+
+        // Start timing
+        timer_inner.tic();
+
+        // Convergence test
+        if (gnorm < tol)
+        {
+            converged_flag = true;
+            break;
+        }
+        // Also exit if objective function value is not finite
+        if (!std::isfinite(objfn))
+            break;
+
+        // Compute y = grad - grad_prev and s = gamma - gamma_prev
+        // ys = y's, yy = y'y
+        solver.compute_low_rank(ys, yy);
+        timer_inner.toc("low_rank");
+
+        // Compute search direction
+        // Sparse Cholesky decomposition and solving + BFGS update rule
+        //
+        // We do not do low-rank update in the first iteration
+        // When <y, s> is too small, don't use low-rank update
+        constexpr double eps = 1e-6;  // Or use std::numeric_limits<double>::epsilon();
+        low_rank = (iter > 0) && (ys > (eps * yy));
+        // Sparse Cholesky decomposition has three main stages:
+        // sparsity pattern analysis, factorization, and solving
+        //
+        // Pattern analysis runs on CPU, and may be time-consuming,
+        // so we can fix the pattern for a few iterations and cyclically update it
+        //
+        // Below are flags to indicate whether we need to analyze or update the sparsity pattern
+        // in the current iteration (basically we update the pattern every `sparsity_pattern_cycle` iterations
+        // and do the sparsity analysis in the next iteration)
+        const bool analyze_pattern = (iter % sparsity_pattern_cycle == 0);
+        const bool update_pattern = (iter % sparsity_pattern_cycle == (sparsity_pattern_cycle - 1));
+
+        // When we need to analyze the sparsity pattern in this iteration,
+        // we also compute the Sinkhorn iterate, since the majority of the pattern analysis
+        // runs on CPU, and we can let GPU work to fill this idle time. In this way,
+        // we do not increase the wall time, but can obtain some useful information about the
+        // next move
+        //
+        // The Sinkhorn iterate is a candidate for the next move. For example, we can
+        // compare the objective function value and gradient of both the Sinkhorn iterate
+        // and the quasi-Newton iterate, and then decide which one is the next move
+        if (analyze_pattern && (candidate_sinkhorn_iter != 0))
+        {
+            // This part will run roughly at the same time as the analysis stage of
+            // the sparse Cholesky decomposition
+            solver.compute_sinkhorn_iterate(candidate_sinkhorn_iter);
+        }
+        solver.compute_search_direc(nnz, ys, low_rank, analyze_pattern, verbose);
+        timer_inner.toc("search_direc");
+
+        // Line search will overwrite d_gamma and d_grad, so
+        // save d_gamma to d_gamma_prev, and d_grad to d_grad_prev
+        solver.save_history();
+
+        // Let Sinkhorn and quasi-Newton computation synchronize here
+        // CUDA_CHECK(cudaDeviceSynchronize());
+        // In fact, the cudaMemcpy() function in solver.save_history() will implicitly synchronize,
+        // so we do not need to explicitly call cudaDeviceSynchronize() here
+
+        // Wolfe Line Search
+        // Will overwrite d_gamma and d_grad
+        // If the updated recompute_fg is false, then the overwritten d_gamma
+        // is the new point, and objfn and d_grad contain the corresponding
+        // objective function value and gradient, respectively
+        // Otherwise, we need to recompute d_gamma, objfn, and d_grad
+        bool recompute_fg = true;
+        alpha = solver.line_search_wolfe(
+            std::min(1.0, 1.5 * alpha), objfn, objfn, recompute_fg, !update_pattern
+        );
+        timer_inner.toc("line_search");
+
+        // Recompute the new point if needed, and compute the new gradient norm
+        const double gnorm_pre = gnorm;
+        if (recompute_fg)
+        {
+            // d_gamma = d_gamma_prev + alpha * direc
+            solver.update_gamma(alpha);
+            // Compute f and g on new point d_gamma
+            // Also compute gradient norm
+            solver.dual_T_objfn_grad(objfn, gnorm, true, !update_pattern);        }
+        else
+        {
+            // f and g have been computed in line search,
+            // so we only compute gradient norm here
+            gnorm = solver.grad_norm();
+        }
+        timer_inner.toc("grad");
+
+        // If analyze_pattern is true, it means that we have also computed the Sinkhorn iterate
+        // If it is better than the quasi-Newton direction (both objfn and gnorm are smaller),
+        // then we overwrite gamma with the Sinkhorn iterate
+        if (analyze_pattern && (candidate_sinkhorn_iter != 0))
+        {
+            double objfn_bcd, gnorm_bcd;
+            solver.objfn_gnorm_bcd(objfn_bcd, gnorm_bcd);
+            // const bool use_sinkhorn_iter = ((objfn_bcd < objfn) && (gnorm_bcd < gnorm));
+            const bool use_sinkhorn_iter = ((objfn_bcd < objfn) && (gnorm_bcd < 10 * gnorm));
+
+            if (verbose >= 2)
+            {
+                std::cout << "[sinkhorn] ------------------------------------------------" << std::endl;
+                std::cout << "║ objfn = " << objfn << ", objfn_bcd = " << objfn_bcd << std::endl;
+                std::cout << "║ gnorm = " << gnorm << ", gnorm_bcd = " << gnorm_bcd << std::endl;
+                std::cout << "║ use_sinkhorn_iter = " << use_sinkhorn_iter << std::endl;
+                std::cout << "===========================================================" << std::endl;
+            }
+
+            if (use_sinkhorn_iter)
+            {
+                // Overwrite d_gamma with the Sinkhorn iterate
+                solver.update_gamma_sinkhorn();
+                // Recompute objfn and gnorm
+                solver.dual_T_objfn_grad(objfn, gnorm, true, !update_pattern);
+            }
+        }
+
+        // Adjust density according to gnorm change
+        if (update_pattern)
+        {
+            const bool bad_move = (gnorm_pre < gnorm_init) && (gnorm > gnorm_pre);
+            density *= (bad_move ? 1.1 : 0.99);
+            density = std::min(density_max, std::max(density_min, density));
+        }
+
+        // decide whether this completed step is the final one
+        // before rebuilding the Hessian at gamma_{k+1}. If the loop will stop,
+        // keep the forward CSR buffers and cuDSS factorization associated with
+        // A_k for the later ownership-transfer stage.
+        const bool converged_after_step =
+            std::isfinite(gnorm) && (gnorm < tol);
+        const bool max_iter_reached =
+            (iter + 1 >= max_iter);
+        const bool invalid_after_step =
+            !std::isfinite(objfn) || !std::isfinite(gnorm);
+        const bool stop_after_step =
+            converged_after_step || max_iter_reached || invalid_after_step;
+
+        // skip construction of the unused next sparse Hessian so the CSR remains
+        // consistent with the factorization being adopted by the backward context.
+        if (!stop_after_step)
+        {
+            shift = std::min(gnorm, shift_max);
+            nnz = solver.dual_sphess(density, shift * reg, !update_pattern);
+        }
+        timer_inner.toc("sphess");
+
+        if (verbose >= 2)
+        {
+            std::cout << "[lowrank]--------------------------------------------------" << std::endl;
+            std::cout << "║ ys = " << ys << ", yy = " << yy << std::endl;
+            std::cout << "║ low_rank = " << low_rank << ", analyze = " << analyze_pattern <<
+                ", update = " << update_pattern << std::endl;
+            std::cout << "===========================================================" << std::endl;
+            std::cout << "[timing]---------------------------------------------------" << std::endl;
+            std::cout << "║ low_rank = " << timer_inner["low_rank"] <<
+                ", search_direc = " << timer_inner["search_direc"] << std::endl;
+            std::cout << "║ line_search = " << timer_inner["line_search"] << std::endl;
+            std::cout << "║ grad = " << timer_inner["grad"] <<
+                ", sphess = " << timer_inner["sphess"] << std::endl;
+            std::cout << "===========================================================" << std::endl << std::endl;
+        }
+
+        *niter = iter + 1;
+
+        if (stop_after_step)
+        {
+            if (invalid_after_step)
+            {
+                invalid_state = true;
+            }
+
+            // Preserve the old next-iteration-entry convergence semantics:
+            // convergence was previously detected only if another loop entry
+            // existed. In particular, reaching max_iter on the same step keeps
+            // the historical converged_flag behavior.
+            if (!max_iter_reached && converged_after_step)
+            {
+                converged_flag = true;
+            }
+            break;
+        }
+    }
+
+    // Export the backward context
+    if (ctx != nullptr)
+    {
+        if (invalid_state || !std::isfinite(objfn))
+        {
+            // Non-finite forward state: the context is left invalid. The
+            // invalid_state flag also covers the delayed-Hessian exit caused
+            // by a non-finite gradient with a finite objective value.
+        }
+        else if (*niter > 0)
+        {
+            // Reuse the existing factorization and its exact backing buffers.
+            solver.transfer_backward_state_to(*ctx, nnz, ys, low_rank);
+        }
+        else
+        {
+            // Immediate convergence: no factorization was ever made.
+            // Factorize the sparsified Hessian at the final point inside
+            // the context, without the low-rank correction.
+            solver.snapshot_sphess(*ctx, nnz);
+            ctx->factorize_fallback(reg);
+        }
+    }
+    if (converged != nullptr)
+    {
+        *converged = converged_flag;
+    }
 
     // Compute final transport plan and output results to host
     solver.output_result(P, dual, output_on_device);

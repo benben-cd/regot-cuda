@@ -193,7 +193,7 @@ __global__ void line_search_fused_kernel2(
     // const int lane_id = tx % warpSize;
     const bool is_lane0 = (tx % warpSize == 0);
     const int flat_idx_Hsl_head = (n + j) * (n + m - 1);
-    const double betaj = beta[j];
+    const double betaj = j_lt_m ? beta[j] : 0.0;
     // Grid-stride loop on i, with boundary check on j
     for (int i = start_i; i < n; i += stride_i)
     {

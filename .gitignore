@@ -4,3 +4,9 @@ cccl*
 *.0
 *.so
 *.pyc
+
+__pycache__/
+build/
+dist/
+*.egg-info/
+*.o

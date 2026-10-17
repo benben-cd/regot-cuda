@@ -344,3 +344,97 @@ void launch_low_rank_search_direc(
         d_s, d_invA_y, term1, term2, d_direc, size
     );
 }
+
+
+// ---------------------------------------------------------------------------
+// M_D^{-1} r = D_A^{-1} r with D_A = diag(A) of the context-owned CSR
+// (the SAME stored-scale sparsified matrix whose factorization the context
+// owns -- matching the /2D benchmark definition exactly).
+
+// One thread per row: scan the row's CSR segment for the diagonal entry and
+// store its reciprocal. Every row must contain exactly one diagonal entry
+// with a positive, finite value; on violation the smallest failing (row+1)
+// is recorded into d_err (initialized to INT_MAX by the caller) and the
+// output slot is zeroed.
+__global__ void extract_inv_diag_kernel(
+    const double* __restrict__ d_values,
+    const int* __restrict__ d_colind,
+    const int* __restrict__ d_rowptr,
+    double* __restrict__ d_inv_diag,
+    int size,
+    int* d_err
+)
+{
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= size)
+    {
+        return;
+    }
+    const int begin = d_rowptr[row];
+    const int end = d_rowptr[row + 1];
+    for (int k = begin; k < end; ++k)
+    {
+        if (d_colind[k] == row)
+        {
+            const double v = d_values[k];
+            if (!isfinite(v) || !(v > 0.0))
+            {
+                atomicMin(d_err, row + 1);
+                d_inv_diag[row] = 0.0;
+                return;
+            }
+            d_inv_diag[row] = 1.0 / v;
+            return;
+        }
+    }
+    // Missing diagonal entry (must not happen: the sparsification keeps the
+    // diagonal by construction).
+    atomicMin(d_err, row + 1);
+    d_inv_diag[row] = 0.0;
+}
+
+void launch_extract_inv_diag(
+    const double* d_values,
+    const int* d_colind,
+    const int* d_rowptr,
+    double* d_inv_diag,
+    int dim,
+    int* d_err,
+    cudaStream_t stream
+)
+{
+    const int blocks = (dim + BLOCK_DIM - 1) / BLOCK_DIM;
+    extract_inv_diag_kernel<<<blocks, BLOCK_DIM, 0, stream>>>(
+        d_values, d_colind, d_rowptr, d_inv_diag, dim, d_err
+    );
+}
+
+// z[i] = inv_diag[i] * r[i]. Fully asynchronous on `stream`: no memcpy, no
+// cuDSS, no synchronization, no temporary allocation.
+__global__ void apply_diag_precond_kernel(
+    const double* __restrict__ d_inv_diag,
+    const double* __restrict__ d_r,
+    double* __restrict__ d_z,
+    int size
+)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < size)
+    {
+        d_z[i] = d_inv_diag[i] * d_r[i];
+    }
+}
+
+void launch_apply_diag_precond(
+    const double* d_inv_diag,
+    const double* d_r,
+    double* d_z,
+    int dim,
+    cudaStream_t stream
+)
+{
+    const int blocks = (dim + BLOCK_DIM - 1) / BLOCK_DIM;
+    apply_diag_precond_kernel<<<blocks, BLOCK_DIM, 0, stream>>>(
+        d_inv_diag, d_r, d_z, dim
+    );
+}

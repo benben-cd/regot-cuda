@@ -16,3 +16,22 @@ except:
     pass
 
 __version__ = "0.1.0"
+
+
+# Differentiable SPLR OT Python API
+try:
+    from . import autograd, backward
+    from .autograd import (
+        splr_ot,
+    )
+    from .backward import solve_backward
+
+    # `torch` here is the native pybind submodule exported by
+    # curegot._internal_torch.
+    torch.splr_ot = splr_ot
+    torch.solve_backward = solve_backward
+
+except ImportError:
+    # Preserve the original optional-PyTorch behavior of curegot:
+    # NumPy-only installations should still be importable.
+    pass
