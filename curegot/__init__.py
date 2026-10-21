@@ -22,13 +22,13 @@ __version__ = "0.1.0"
 try:
     from . import autograd, backward
     from .autograd import (
-        splr_ot,
+        sinkhorn_autograd,
     )
     from .backward import solve_backward
 
     # `torch` here is the native pybind submodule exported by
     # curegot._internal_torch.
-    torch.splr_ot = splr_ot
+    torch.sinkhorn_autograd = sinkhorn_autograd
     torch.solve_backward = solve_backward
 
 except ImportError:

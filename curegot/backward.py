@@ -18,7 +18,7 @@ def solve_backward(
     T,
     G,
     ctx,
-    eta,
+    reg,
     *,
     preconditioner="diag",
     tol=1e-6,
@@ -32,7 +32,7 @@ def solve_backward(
         G:   [n, m] float64 CUDA tensor, upstream gradient dL/dT.
         ctx: SPLRBackwardContext returned by sinkhorn_splr_save_ctx
              (out["context"]).
-        eta: entropic regularization used in the forward pass.
+        reg: entropic regularization used in the forward pass.
         preconditioner: "diag" (default) | "splr" | "none".
         tol:     PCG relative residual tolerance (default 1e-6).
         max_iter: PCG iteration cap.
@@ -69,6 +69,6 @@ def solve_backward(
     )
 
     # Assemble dL/dM from the solved dual perturbation.
-    result["grad"] = assemble_grad(T, G, result["lambda"], eta, n, m)
+    result["grad"] = assemble_grad(T, G, result["lambda"], reg, n, m)
     result["preconditioner"] = preconditioner
     return result

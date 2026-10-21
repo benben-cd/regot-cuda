@@ -5,6 +5,7 @@ Run from an installed candidate: python -B test/test_backward.py
 """
 
 import gc
+from unittest.mock import patch
 
 import torch
 
@@ -31,7 +32,7 @@ def relative(actual, expected):
     return float(torch.linalg.norm(actual - expected) / denominator)
 
 
-def dense_gradient(plan, upstream, eta):
+def dense_gradient(plan, upstream, reg):
     n = plan.shape[0]
     reduced_plan = plan[:, :-1]
     Q = torch.cat(
@@ -45,7 +46,7 @@ def dense_gradient(plan, upstream, eta):
     rhs = torch.cat([weighted.sum(1), weighted.sum(0)[:-1]])
     dual = torch.linalg.solve(Q, rhs)
     beta = torch.cat([dual[n:], dual.new_zeros(1)])
-    return plan * (dual[:n, None] + beta[None, :] - upstream) / eta
+    return plan * (dual[:n, None] + beta[None, :] - upstream) / reg
 
 
 def expect_error(error_type, message, call):
@@ -61,12 +62,12 @@ def test_backward_against_dense_reference():
     # Create test data.
     M, a, b = problem()
     G = random_gradient(M)
-    options = {"eta": 0.3, "tol": 1e-8, "density": 0.5}
+    options = {"reg": 0.3, "tol": 1e-8}
 
     for mode in ("none", "diag", "splr"):
         # Run differentiable SPLR OT.
         cost = M.clone().requires_grad_(True)
-        plan = curegot.torch.splr_ot(
+        plan = curegot.torch.sinkhorn_autograd(
             cost,
             a,
             b,
@@ -80,7 +81,7 @@ def test_backward_against_dense_reference():
         loss.backward()
 
         # Compute the independent dense reference.
-        expected = dense_gradient(plan.detach(), G, options["eta"])
+        expected = dense_gradient(plan.detach(), G, options["reg"])
 
         # Each preconditioner must give the correct cost gradient.
         error = relative(cost.grad, expected)
@@ -94,13 +95,13 @@ def test_finite_difference():
     # Create test data.
     M, a, b = problem()
     G = random_gradient(M)
-    options = {"eta": 0.3, "tol": 1e-8, "density": 0.5}
+    options = {"reg": 0.3, "tol": 1e-8}
 
     # Compute the autograd gradient for each preconditioner.
     gradients = []
     for mode in ("none", "diag", "splr"):
         cost = M.clone().requires_grad_(True)
-        plan = curegot.torch.splr_ot(
+        plan = curegot.torch.sinkhorn_autograd(
             cost,
             a,
             b,
@@ -116,8 +117,12 @@ def test_finite_difference():
     direction = torch.zeros_like(M)
     direction[2, 3] = 1
     with torch.no_grad():
-        plus = curegot.torch.splr_ot(M + epsilon * direction, a, b, **options)
-        minus = curegot.torch.splr_ot(M - epsilon * direction, a, b, **options)
+        plus = curegot.torch.sinkhorn_autograd(
+            M + epsilon * direction, a, b, **options
+        )
+        minus = curegot.torch.sinkhorn_autograd(
+            M - epsilon * direction, a, b, **options
+        )
 
     # Compute the central finite difference.
     finite_difference = float(((plus - minus) * G).sum() / (2 * epsilon))
@@ -136,14 +141,13 @@ def test_active_rank2():
 
     # Run differentiable SPLR OT.
     cost = M.clone().requires_grad_(True)
-    plan = curegot.torch.splr_ot(
+    plan = curegot.torch.sinkhorn_autograd(
         cost,
         a,
         b,
-        eta=0.03,
+        reg=0.03,
         tol=1e-8,
         max_iter=200,
-        density=0.1,
         backward_preconditioner="splr",
         backward_tol=1e-12,
     )
@@ -162,9 +166,33 @@ def test_active_rank2():
 
 
 def test_forward_context():
-    # Create data and a controlled legacy forward result.
+    # Exercise public forward controls through the real native solver.
     M, a, b = problem()
     G = random_gradient(M)
+    cost = M.clone().requires_grad_(True)
+    with patch.object(
+        curegot.torch,
+        "sinkhorn_splr_save_ctx",
+        wraps=curegot.torch.sinkhorn_splr_save_ctx,
+    ) as forward:
+        plan = curegot.torch.sinkhorn_autograd(
+            cost,
+            a,
+            b,
+            0.3,
+            tol=1e-8,
+            max_iter=200,
+            verbose=1,
+            backward_tol=1e-12,
+        )
+    assert forward.call_args.args[4:] == (1e-8, 200, 1)
+
+    # Verify backward after forwarding the requested convergence controls.
+    plan.backward(G)
+    expected = dense_gradient(plan.detach(), G, 0.3)
+    assert relative(cost.grad, expected) < 1e-8
+
+    # Create a controlled legacy forward result for context adoption/fallback.
     options = {"density": 1.0, "candidate_sinkhorn_iter": 0}
     legacy = curegot.torch.sinkhorn_splr(M, a, b, 0.3, 1e-8, 1000, 0, **options)
 
@@ -208,13 +236,12 @@ def test_nondefault_stream():
     with torch.cuda.stream(stream):
         # Run differentiable SPLR OT on the non-default stream.
         cost = M.clone().requires_grad_(True)
-        plan = curegot.torch.splr_ot(
+        plan = curegot.torch.sinkhorn_autograd(
             cost,
             a,
             b,
-            eta=0.3,
+            reg=0.3,
             tol=1e-8,
-            density=0.5,
             backward_preconditioner="splr",
             backward_tol=1e-12,
         )
@@ -244,12 +271,12 @@ def test_lifetime_and_repeated_backward():
     # Create test data.
     M, a, b = problem()
     G = random_gradient(M)
-    options = {"eta": 0.3, "tol": 1e-8, "density": 0.5}
+    options = {"reg": 0.3, "tol": 1e-8}
 
     for mode in ("none", "diag", "splr"):
         # Build the forward graph.
         cost = M.clone().requires_grad_(True)
-        plan = curegot.torch.splr_ot(
+        plan = curegot.torch.sinkhorn_autograd(
             cost,
             a,
             b,
@@ -261,7 +288,7 @@ def test_lifetime_and_repeated_backward():
 
         # Run the first backward and compare with the dense reference.
         loss.backward(retain_graph=True)
-        expected = dense_gradient(plan.detach(), G, options["eta"])
+        expected = dense_gradient(plan.detach(), G, options["reg"])
         assert relative(cost.grad, expected) < 1e-8
         first = cost.grad.clone()
 
@@ -276,10 +303,10 @@ def test_lifetime_and_repeated_backward():
 
     # Build a graph whose forward-local plan can be released.
     cost = M.clone().requires_grad_(True)
-    plan = curegot.torch.splr_ot(
+    plan = curegot.torch.sinkhorn_autograd(
         cost, a, b, **options, backward_preconditioner="splr", backward_tol=1e-12
     )
-    expected = dense_gradient(plan.detach(), 2 * plan.detach(), options["eta"])
+    expected = dense_gradient(plan.detach(), 2 * plan.detach(), options["reg"])
     loss = plan.square().sum()
 
     # Release forward-local references.
@@ -303,7 +330,7 @@ def test_sizes_and_failures():
         expect_error(
             ValueError,
             "n >= 1",
-            lambda: curegot.torch.splr_ot(M, a, b, eta=0.3),
+            lambda: curegot.torch.sinkhorn_autograd(M, a, b, reg=0.3),
         )
 
     # Create the smallest supported problem.
@@ -314,7 +341,7 @@ def test_sizes_and_failures():
     b = M.new_full((2,), 0.5)
 
     # Run differentiable SPLR OT.
-    plan = curegot.torch.splr_ot(M, a, b, eta=0.3, tol=1e-8)
+    plan = curegot.torch.sinkhorn_autograd(M, a, b, reg=0.3, tol=1e-8)
 
     # The single-row plan is fixed by the column marginals.
     assert torch.allclose(plan, b[None, :], rtol=0, atol=1e-8)
@@ -330,20 +357,19 @@ def test_sizes_and_failures():
     expect_error(
         RuntimeError,
         "forward solver did not converge",
-        lambda: curegot.torch.splr_ot(
-            M, a, b, eta=0.3, tol=1e-8, max_iter=1, density=0.5
+        lambda: curegot.torch.sinkhorn_autograd(
+            M, a, b, reg=0.3, tol=1e-8, max_iter=1
         ),
     )
 
     # Build a converged forward graph with a one-step backward limit.
     cost = M.clone().requires_grad_(True)
-    plan = curegot.torch.splr_ot(
+    plan = curegot.torch.sinkhorn_autograd(
         cost,
         a,
         b,
-        eta=0.3,
+        reg=0.3,
         tol=1e-8,
-        density=0.5,
         backward_preconditioner="none",
         backward_max_iter=1,
     )
@@ -371,7 +397,7 @@ def test_tiny_gradient():
     G = M.new_tensor([[1.0, -0.5, 0.3], [0.2, 0.8, -0.4]])
 
     # Run public backward with a tiny upstream gradient and default settings.
-    plan = curegot.torch.splr_ot(M, a, b, eta=0.3, tol=1e-8)
+    plan = curegot.torch.sinkhorn_autograd(M, a, b, reg=0.3, tol=1e-8)
     scale = 1e-160
     plan.backward(G * scale)
 
