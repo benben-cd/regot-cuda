@@ -214,10 +214,11 @@ perturb marginals along equal-mass directions (or perturb the logits), rather
 than changing a single marginal coordinate while holding the other fixed.
 
 See [the example](examples/differentiable_splr_ot.py). After installation, run
-`python -B test/test_backward.py` for the dense oracle, all three autograd
+`python -B test/test_cost_grad.py` for the dense oracle, all three autograd
 preconditioners, context lifetime, fallback and active rank-2 checks. Run
-`python -B -m unittest discover -s test -p test_marginal_grad.py -v` for
-marginal gradients, feasible finite differences and softmax chain rules.
+`python -B test/test_marginal_grad.py` for
+marginal gradients, feasible marginal/joint-mass finite differences and shared
+autograd input-contract checks.
 
 ## Tests
 
